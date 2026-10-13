@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- None yet!
+- tcp: stateless SYN cookies for listening sockets: `Socket::set_syn_cookies(Some(key))` makes a socket in the LISTEN state answer SYNs with a cookie and keep no state, and take the connection from the ACK that proves the client got it (no window scaling, SACK or timestamps on such connections; the MSS is rounded down to 536, 1220, 1440 or 1460).
 
 ## [0.14.0] - 2026-08-07
 
