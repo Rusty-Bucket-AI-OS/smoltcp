@@ -482,6 +482,9 @@ pub struct Socket<'a> {
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// The secret for stateless SYN cookies. While it is set, a socket in the LISTEN state answers
+    /// SYNs without keeping any state. See [set_syn_cookies](#method.set_syn_cookies).
+    syn_cookie_key: Option<syn_cookie::Key>,
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
@@ -598,6 +601,7 @@ impl<'a> Socket<'a> {
             timeout: None,
             keep_alive: None,
             hop_limit: None,
+            syn_cookie_key: None,
             listen_endpoint: IpListenEndpoint::default(),
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
@@ -933,6 +937,32 @@ impl<'a> Socket<'a> {
             self.rx_waker.wake();
             self.tx_waker.wake();
         }
+    }
+
+    /// Turn stateless SYN cookies on (with a secret key) or off (`None`).
+    ///
+    /// A socket in the LISTEN state with cookies on answers every SYN with a SYN|ACK whose initial
+    /// sequence number is a keyed hash of the connection and a coarse clock, and **stays in the
+    /// LISTEN state**: it keeps no record of the half-open connection, so a flood of SYNs cannot
+    /// use up sockets or memory (RFC 4987, section 3.6). When the client's ACK comes back and its
+    /// acknowledgement number checks out, the socket takes the connection and goes straight to the
+    /// ESTABLISHED state (a data segment riding on the ACK is delivered). A forged or stale ACK is
+    /// not accepted, so the packet falls through to the usual RST.
+    ///
+    /// The price is what a SYN cookie cannot remember: the connection does not use window
+    /// scaling, selective acknowledgements or timestamps, and the MSS is the client's offer
+    /// rounded down to one of 536, 1220, 1440 or 1460. Use cookies when under attack and leave them
+    /// off otherwise; changing the setting does not disturb connections already made.
+    ///
+    /// The key must come from a good random source; anyone who learns it can forge cookies.
+    /// A cookie lives between 64 and 128 seconds, so a key change drops handshakes in progress.
+    pub fn set_syn_cookies(&mut self, key: Option<[u8; 16]>) {
+        self.syn_cookie_key = key;
+    }
+
+    /// Whether stateless SYN cookies are on. See [set_syn_cookies](#method.set_syn_cookies).
+    pub fn syn_cookies(&self) -> bool {
+        self.syn_cookie_key.is_some()
     }
 
     /// Start listening on the given endpoint.
@@ -1553,18 +1583,62 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
-    pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+    /// Whether a segment is for the endpoint this socket listens on.
+    fn listening_for(&self, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+        let addr_ok = match self.listen_endpoint.addr {
+            Some(addr) => ip_repr.dst_addr() == addr,
+            None => true,
+        };
+        addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+    }
+
+    /// The endpoints of a segment, from this side: (remote, local).
+    fn endpoints_of(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpEndpoint, IpEndpoint) {
+        (
+            IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
+            IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
+        )
+    }
+
+    /// If `repr` is the ACK that ends a handshake begun with one of our cookies, the MSS the
+    /// cookie carried.
+    fn cookie_ack(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> Option<u16> {
+        let key = self.syn_cookie_key.as_ref()?;
+        if !matches!(repr.control, TcpControl::None | TcpControl::Psh) {
+            return None;
+        }
+        let ack = repr.ack_number?;
+        let (remote, local) = Self::endpoints_of(ip_repr, repr);
+        syn_cookie::check(
+            key,
+            &syn_cookie::Ends {
+                remote: &remote,
+                local: &local,
+            },
+            (repr.seq_number - 1).0 as u32,
+            (ack - 1).0 as u32,
+            cx.now().secs() as u64,
+        )
+    }
+
+    pub(crate) fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
         }
 
-        // If we're still listening for SYNs and the packet has an ACK or a RST,
-        // it cannot be destined to this socket, but another one may well listen
-        // on the same local endpoint.
-        if self.state == State::Listen
-            && (repr.ack_number.is_some() || repr.control == TcpControl::Rst)
-        {
-            return false;
+        if self.state == State::Listen {
+            // An RST cannot be destined to a socket that is only listening.
+            if repr.control == TcpControl::Rst {
+                return false;
+            }
+            // If we're still listening for SYNs and the packet has an ACK, it cannot be
+            // destined to this socket, but another one may well listen on the same local
+            // endpoint. The exception is the last ACK of a handshake that began with one of
+            // our SYN cookies.
+            if repr.ack_number.is_some() {
+                return self.listening_for(ip_repr, repr)
+                    && self.cookie_ack(cx, ip_repr, repr).is_some();
+            }
         }
 
         if let Some(tuple) = &self.tuple {
@@ -1575,12 +1649,80 @@ impl<'a> Socket<'a> {
                 && repr.src_port == tuple.remote.port
         } else {
             // We're listening, reject packets not matching the listen endpoint.
-            let addr_ok = match self.listen_endpoint.addr {
-                Some(addr) => ip_repr.dst_addr() == addr,
-                None => true,
-            };
-            addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+            self.listening_for(ip_repr, repr)
         }
+    }
+
+    /// Answers a SYN with a cookie as the initial sequence number, keeping no state.
+    fn syn_cookie_reply(
+        &self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        let key = self.syn_cookie_key.as_ref()?;
+        let (remote, local) = Self::endpoints_of(ip_repr, repr);
+        // A zero MSS is treated as if the option were absent, like elsewhere.
+        let offered = repr.max_seg_size.filter(|m| *m != 0).unwrap_or(0);
+        let cookie = syn_cookie::issue(
+            key,
+            &syn_cookie::Ends {
+                remote: &remote,
+                local: &local,
+            },
+            repr.seq_number.0 as u32,
+            offered,
+            cx.now().secs() as u64,
+        );
+        let (_, mut reply) = Self::reply(ip_repr, repr);
+        reply.control = TcpControl::Syn;
+        reply.seq_number = TcpSeqNumber(cookie as i32);
+        reply.ack_number = Some(repr.seq_number + 1);
+        // No window scaling, so the window must not be scaled in the SYN|ACK either.
+        reply.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+        let ip_reply = IpRepr::new(
+            ip_repr.dst_addr(),
+            ip_repr.src_addr(),
+            IpProtocol::Tcp,
+            0,
+            self.hop_limit.unwrap_or(64),
+        );
+        // See RFC 6691 for an explanation of this calculation.
+        let mss = cx.ip_mtu() - ip_reply.header_len() - TCP_HEADER_LEN;
+        reply.max_seg_size = Some(mss as u16);
+        let mut ip_reply = ip_reply;
+        ip_reply.set_payload_len(reply.buffer_len());
+        tcp_trace!("answering SYN with a cookie");
+        Some((ip_reply, reply))
+    }
+
+    /// Takes the connection a valid cookie ACK completes: the state this socket would be in had it
+    /// kept the SYN, sent the SYN|ACK, and is now looking at the client's ACK.
+    fn accept_cookie(&mut self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr, mss: u16) {
+        tcp_trace!("received the ACK of a SYN cookie");
+        let cookie = repr.ack_number.unwrap_or_default() - 1;
+        self.tuple = Some(Tuple {
+            local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
+            remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
+        });
+        self.local_seq_no = cookie;
+        // The SYN took one sequence number, so the next byte the client sends is `seq_number`.
+        self.remote_seq_no = repr.seq_number;
+        // What `dispatch` records after sending the SYN|ACK.
+        self.remote_last_seq = self.local_seq_no + 1;
+        self.remote_last_ack = Some(self.remote_seq_no);
+        self.remote_last_win = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+        // Nothing but the MSS survives in a cookie.
+        self.remote_mss = (mss as usize).max(MIN_REMOTE_MSS);
+        self.congestion_controller
+            .inner_mut()
+            .set_mss(self.remote_mss);
+        self.remote_has_sack = false;
+        self.remote_win_scale = None;
+        self.remote_win_shift = 0;
+        self.tsval_generator = None;
+        self.set_state(State::SynReceived);
+        self.timer.set_for_idle(cx.now(), self.keep_alive);
     }
 
     pub(crate) fn process(
@@ -1590,6 +1732,22 @@ impl<'a> Socket<'a> {
         repr: &TcpRepr,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
+
+        // With cookies on, a listening socket keeps no state for a SYN, and takes a connection
+        // only from the ACK that proves the client got the cookie.
+        if self.state == State::Listen && self.syn_cookie_key.is_some() {
+            match (repr.control, repr.ack_number) {
+                (TcpControl::Syn, None) => return self.syn_cookie_reply(cx, ip_repr, repr),
+                (TcpControl::None | TcpControl::Psh, Some(_)) => {
+                    // `accepts` checked the cookie; check again rather than trust the caller.
+                    match self.cookie_ack(cx, ip_repr, repr) {
+                        Some(mss) => self.accept_cookie(cx, ip_repr, repr, mss),
+                        None => return Some(Self::rst_reply(ip_repr, repr)),
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Consider how much the sequence number space differs from the transmit buffer space.
         let (sent_syn, sent_fin) = match self.state {
@@ -3537,6 +3695,427 @@ mod test {
         assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
 
         assert_eq!(s.state, State::Listen);
+    }
+
+    const COOKIE_KEY: [u8; 16] = [
+        0x13, 0x37, 0xc0, 0xde, 0x01, 0x02, 0x03, 0x04, 0x99, 0x98, 0x97, 0x96, 0x55, 0x44, 0x33,
+        0x22,
+    ];
+
+    fn socket_listen_with_cookies() -> TestSocket {
+        let mut s = socket_listen();
+        s.set_syn_cookies(Some(COOKIE_KEY));
+        s
+    }
+
+    /// The cookie the socket must answer a SYN from `REMOTE_END` to `LOCAL_END` with.
+    fn cookie_for(client_isn: TcpSeqNumber, mss: u16, now_secs: u64) -> TcpSeqNumber {
+        TcpSeqNumber(syn_cookie::issue(
+            &COOKIE_KEY,
+            &syn_cookie::Ends {
+                remote: &REMOTE_END,
+                local: &LOCAL_END,
+            },
+            client_isn.0 as u32,
+            mss,
+            now_secs,
+        ) as i32)
+    }
+
+    /// The IP header of a segment from the remote end to the local one, as `send` makes it.
+    fn from_remote() -> IpRepr {
+        IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 20,
+            hop_limit: 64,
+        })
+    }
+
+    fn cookie_syn() -> TcpRepr<'static> {
+        TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            max_seg_size: Some(BASE_MSS),
+            ..SEND_TEMPL
+        }
+    }
+
+    fn cookie_synack(cookie: TcpSeqNumber, mss: u16) -> TcpRepr<'static> {
+        TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: cookie,
+            ack_number: Some(REMOTE_SEQ + 1),
+            max_seg_size: Some(mss),
+            window_len: 64,
+            ..RECV_TEMPL
+        }
+    }
+
+    #[test]
+    fn test_syn_cookies_are_off_by_default() {
+        let s = socket_listen();
+        assert!(!s.syn_cookies());
+        let mut s = socket_listen_with_cookies();
+        assert!(s.syn_cookies());
+        s.set_syn_cookies(None);
+        assert!(!s.syn_cookies());
+        // Off, a SYN makes the socket SYN-RECEIVED as always.
+        send!(s, cookie_syn());
+        assert_eq!(s.state, State::SynReceived);
+    }
+
+    #[test]
+    fn test_syn_cookie_syn_is_answered_and_leaves_no_state() {
+        let mut s = socket_listen_with_cookies();
+        let cookie = cookie_for(REMOTE_SEQ, BASE_MSS, 0);
+        let answer = Some(cookie_synack(cookie, BASE_MSS));
+        send!(s, cookie_syn(), answer);
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.tuple, None);
+        assert_eq!(s.listen_endpoint, LISTEN_END);
+        recv_nothing!(s);
+        // The same SYN again gets the same answer (a retransmission), and so does a flood of
+        // SYNs from other ports: the socket is still listening.
+        send!(s, cookie_syn(), answer);
+        assert_eq!(s.state, State::Listen);
+        for port in 1..100u16 {
+            let syn = TcpRepr {
+                src_port: REMOTE_PORT + port,
+                ..cookie_syn()
+            };
+            assert!(send(&mut s, Instant::from_millis(0), &syn).is_some());
+            assert_eq!(s.state, State::Listen);
+        }
+    }
+
+    #[test]
+    fn test_syn_cookie_handshake_completes() {
+        let mut s = socket_listen_with_cookies();
+        let cookie = cookie_for(REMOTE_SEQ, BASE_MSS, 0);
+        send!(s, cookie_syn(), Some(cookie_synack(cookie, BASE_MSS)));
+        // The client's ACK echoes the cookie plus one.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(cookie + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.tuple, Some(TUPLE));
+        assert_eq!(s.local_seq_no, cookie + 1, "the SYN|ACK is acknowledged");
+        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
+        assert_eq!(s.remote_mss, BASE_MSS as usize);
+        assert!(!s.remote_has_sack);
+        assert_eq!(s.remote_win_scale, None);
+        assert_eq!(s.remote_win_shift, 0);
+        // The connection works: data both ways.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(cookie + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.recv(|data| (6, data.to_vec())), Ok(b"abcdef".to_vec()));
+        assert_eq!(s.send_slice(b"hello"), Ok(5));
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: cookie + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                payload: &b"hello"[..],
+                window_len: 64,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_syn_cookie_ack_may_carry_data() {
+        let mut s = socket_listen_with_cookies();
+        let cookie = cookie_for(REMOTE_SEQ, BASE_MSS, 0);
+        send!(s, cookie_syn(), Some(cookie_synack(cookie, BASE_MSS)));
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Psh,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(cookie + 1),
+                payload: &b"GET /"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.recv(|data| (5, data.to_vec())), Ok(b"GET /".to_vec()));
+    }
+
+    #[test]
+    fn test_syn_cookie_mss_is_rounded_down_to_the_table() {
+        for (offered, carried) in [
+            (Some(1000), 536),
+            (Some(1400), 1220),
+            (None, 536),
+            (Some(0), 536),
+        ] {
+            let mut s = socket_listen_with_cookies();
+            let syn = TcpRepr {
+                max_seg_size: offered,
+                ..cookie_syn()
+            };
+            let cookie = cookie_for(REMOTE_SEQ, offered.unwrap_or(0), 0);
+            send!(s, syn, Some(cookie_synack(cookie, BASE_MSS)));
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(cookie + 1),
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state, State::Established);
+            assert_eq!(s.remote_mss, carried, "offered {offered:?}");
+        }
+    }
+
+    #[test]
+    fn test_syn_cookie_forged_acks_are_not_accepted() {
+        let mut s = socket_listen_with_cookies();
+        let cookie = cookie_for(REMOTE_SEQ, 1460, 0); // the largest MSS: the highest index
+        let ack = |seq: TcpSeqNumber, ack: TcpSeqNumber| TcpRepr {
+            seq_number: seq,
+            ack_number: Some(ack),
+            ..SEND_TEMPL
+        };
+        // Never answered: no cookie was made.
+        for forged in [
+            ack(REMOTE_SEQ + 1, LOCAL_SEQ + 1),
+            ack(REMOTE_SEQ + 1, TcpSeqNumber(0)),
+            // The cookie carries the MSS in its low bits, so the numbers just below the right one
+            // name smaller MSS values and pass; the others on either side do not.
+            ack(REMOTE_SEQ + 1, cookie + 2),
+            ack(REMOTE_SEQ + 1, cookie - 3),
+            // The right cookie for another sequence number.
+            ack(REMOTE_SEQ + 2, cookie + 1),
+            ack(REMOTE_SEQ, cookie + 1),
+        ] {
+            assert!(
+                !s.socket.accepts(&mut s.cx, &from_remote(), &forged),
+                "{forged}"
+            );
+            assert_eq!(s.state, State::Listen);
+        }
+        // The right one is accepted by `accepts`.
+        assert!(
+            s.socket
+                .accepts(&mut s.cx, &from_remote(), &ack(REMOTE_SEQ + 1, cookie + 1))
+        );
+        // From another port or to another port it is not.
+        let elsewhere = TcpRepr {
+            src_port: REMOTE_PORT + 1,
+            ..ack(REMOTE_SEQ + 1, cookie + 1)
+        };
+        assert!(!s.socket.accepts(&mut s.cx, &from_remote(), &elsewhere));
+        let wrong_port = TcpRepr {
+            dst_port: LOCAL_PORT + 1,
+            ..ack(REMOTE_SEQ + 1, cookie + 1)
+        };
+        assert!(!s.socket.accepts(&mut s.cx, &from_remote(), &wrong_port));
+        // Not a plain ACK: an ACK with a FIN or an RST is not the end of a handshake.
+        for control in [TcpControl::Fin, TcpControl::Rst, TcpControl::Syn] {
+            let r = TcpRepr {
+                control,
+                ..ack(REMOTE_SEQ + 1, cookie + 1)
+            };
+            assert!(
+                !s.socket.accepts(&mut s.cx, &from_remote(), &r),
+                "{control:?}"
+            );
+        }
+        // Other key: no.
+        let mut other = socket_listen();
+        other.set_syn_cookies(Some([0; 16]));
+        assert!(!other.socket.accepts(
+            &mut other.cx,
+            &from_remote(),
+            &ack(REMOTE_SEQ + 1, cookie + 1)
+        ));
+        // And without cookies an ACK never reaches a listener (it never did).
+        let mut plain = socket_listen();
+        assert!(!plain.socket.accepts(
+            &mut plain.cx,
+            &from_remote(),
+            &ack(REMOTE_SEQ + 1, cookie + 1)
+        ));
+    }
+
+    #[test]
+    fn test_syn_cookie_expires() {
+        let cookie = cookie_for(REMOTE_SEQ, BASE_MSS, 0);
+        let ack = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(cookie + 1),
+            ..SEND_TEMPL
+        };
+        // Good for the period it was made in and the next (up to 128 seconds on).
+        for (secs, good) in [
+            (0, true),
+            (63, true),
+            (64, true),
+            (127, true),
+            (128, false),
+            (10_000, false),
+        ] {
+            let mut s = socket_listen_with_cookies();
+            s.cx.set_now(Instant::from_secs(secs));
+            assert_eq!(
+                s.socket.accepts(&mut s.cx, &from_remote(), &ack),
+                good,
+                "{secs}s"
+            );
+        }
+    }
+
+    #[test]
+    fn test_syn_cookie_other_traffic_is_as_before() {
+        let mut s = socket_listen_with_cookies();
+        // An RST is ignored by a listener.
+        let rst = TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+        assert!(!s.socket.accepts(&mut s.cx, &from_remote(), &rst));
+        // A SYN with an ACK is not a first SYN.
+        let syn_ack = TcpRepr {
+            ack_number: Some(LOCAL_SEQ),
+            ..cookie_syn()
+        };
+        assert!(!s.socket.accepts(&mut s.cx, &from_remote(), &syn_ack));
+        // Closing the socket ends the listening, with or without cookies.
+        s.close();
+        assert_eq!(s.state, State::Closed);
+        assert!(s.syn_cookies(), "the setting stays across close and listen");
+        assert_eq!(s.listen(LISTEN_END), Ok(()));
+        assert_eq!(s.state, State::Listen);
+    }
+
+    #[test]
+    fn test_syn_cookie_one_socket_serves_many_clients() {
+        let mut s = socket_listen_with_cookies();
+        // Many SYNs while it listens; one completes.
+        for port in 1..50u16 {
+            let syn = TcpRepr {
+                src_port: REMOTE_PORT + port,
+                ..cookie_syn()
+            };
+            assert!(send(&mut s, Instant::from_millis(0), &syn).is_some());
+        }
+        let cookie = cookie_for(REMOTE_SEQ, BASE_MSS, 0);
+        send!(s, cookie_syn(), Some(cookie_synack(cookie, BASE_MSS)));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(cookie + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        // The socket is now a connection; a new SYN is not its business.
+        let syn = TcpRepr {
+            src_port: REMOTE_PORT + 7,
+            ..cookie_syn()
+        };
+        assert!(!s.socket.accepts(&mut s.cx, &from_remote(), &syn));
+    }
+
+    /// Moves packets between a client socket and a server socket until both are quiet.
+    fn pump(client: &mut TestSocket, server: &mut TestSocket) {
+        for _ in 0..10 {
+            let mut to_server: Vec<(IpRepr, TcpRepr<'static>)> = Vec::new();
+            let mut to_client: Vec<(IpRepr, TcpRepr<'static>)> = Vec::new();
+            let keep = |ip: IpRepr, repr: &TcpRepr| {
+                // The payload is copied (and leaked: this is a test) to outlive the dispatch.
+                let payload: &'static [u8] = Box::leak(repr.payload.to_vec().into_boxed_slice());
+                (ip, TcpRepr { payload, ..*repr })
+            };
+            let _ = client.socket.dispatch(&mut client.cx, |_, _, (ip, repr)| {
+                to_server.push(keep(ip, &repr));
+                Ok::<(), ()>(())
+            });
+            let _ = server.socket.dispatch(&mut server.cx, |_, _, (ip, repr)| {
+                to_client.push(keep(ip, &repr));
+                Ok::<(), ()>(())
+            });
+            if to_server.is_empty() && to_client.is_empty() {
+                return;
+            }
+            for (ip, repr) in to_server {
+                if server.socket.accepts(&mut server.cx, &ip, &repr) {
+                    if let Some((_, reply)) = server.socket.process(&mut server.cx, &ip, &repr) {
+                        let ip = IpReprIpvX(IpvXRepr {
+                            src_addr: LOCAL_ADDR,
+                            dst_addr: REMOTE_ADDR,
+                            next_header: IpProtocol::Tcp,
+                            payload_len: reply.buffer_len(),
+                            hop_limit: 64,
+                        });
+                        to_client.push((ip, reply));
+                    }
+                }
+            }
+            for (ip, repr) in to_client {
+                if client.socket.accepts(&mut client.cx, &ip, &repr) {
+                    let _ = client.socket.process(&mut client.cx, &ip, &repr);
+                }
+            }
+        }
+        panic!("the packets never stopped");
+    }
+
+    #[test]
+    fn test_syn_cookie_real_client_and_server() {
+        let mut server = socket_listen_with_cookies();
+        let mut client = socket();
+        // The client is the other host: it owns the remote address.
+        let mut addrs = heapless::Vec::<IpCidr, IFACE_MAX_ADDR_COUNT>::new();
+        addrs.push(IpCidr::new(REMOTE_ADDR.into(), 24)).unwrap();
+        client.cx.set_ip_addrs(addrs);
+        client
+            .socket
+            .connect(&mut client.cx, LOCAL_END, REMOTE_END)
+            .unwrap();
+        pump(&mut client, &mut server);
+        assert_eq!(client.state, State::Established);
+        assert_eq!(server.state, State::Established);
+        assert_eq!(server.tuple, Some(TUPLE));
+        // Data both ways over a connection the server never held half open.
+        client.send_slice(b"request").unwrap();
+        pump(&mut client, &mut server);
+        assert_eq!(
+            server.recv(|d| (d.len(), d.to_vec())),
+            Ok(b"request".to_vec())
+        );
+        server.send_slice(b"response").unwrap();
+        pump(&mut client, &mut server);
+        assert_eq!(
+            client.recv(|d| (d.len(), d.to_vec())),
+            Ok(b"response".to_vec())
+        );
+        // And a clean close.
+        client.close();
+        pump(&mut client, &mut server);
+        server.close();
+        pump(&mut client, &mut server);
+        assert_eq!(server.state, State::Closed);
     }
 
     #[test]

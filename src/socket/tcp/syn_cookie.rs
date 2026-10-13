@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 //! Stateless SYN cookies for listening TCP sockets (see RFC 4987, section 3.6).
 //!
 //! A server under a SYN flood cannot afford a connection record for every SYN. With a cookie it
@@ -12,7 +10,9 @@
 //! The cookie is `h1 + client_isn + (t << 24) + ((h2 + mss_index) & 0xFF_FFFF)` with wrapping
 //! arithmetic, where `h1` and `h2` are different keyed hashes (SipHash-2-4) over the
 //! endpoints, the client's sequence number and the period `t`. A forged ACK is accepted with a
-//! chance of about 2^-22, and a cookie is good only for the sequence number it was made for.
+//! chance of about 2^-30 per period, and a cookie is good only for the sequence number it was made for.
+//! (The MSS index sits in the low bits, so the three numbers just below a valid cookie are valid
+//! too and carry smaller MSS values; the client could have offered those anyway.)
 
 use crate::wire::{IpAddress, IpEndpoint};
 
