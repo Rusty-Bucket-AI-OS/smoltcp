@@ -19,6 +19,7 @@ use crate::wire::{
 };
 
 mod congestion;
+mod syn_cookie;
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
